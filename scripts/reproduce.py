@@ -11,6 +11,8 @@ import sys
 import time
 from pathlib import Path
 
+os.environ.setdefault("MUJOCO_GL", "egl")
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -23,7 +25,7 @@ def worker(mode, device):
     import warp as wp
     from mujoco_warp._src.types import BroadphaseType
 
-    m = mujoco.MjModel.from_xml_path(str(ROOT / "assets/scene.xml"))
+    m = mujoco.MjModel.from_xml_path(str(ROOT / "assets/variants.xml"))
     slot, probe = m.geom("slot").id, m.geom("probe").id
     frames = []
     with wp.ScopedDevice(device):
@@ -33,7 +35,7 @@ def worker(mode, device):
         ids[0, slot] = -1
         w.geom_dataid = wp.array(ids, dtype=int)
         d = mw.make_data(m, nworld=2, nconmax=64, njmax=64)
-        for x in np.linspace(-0.30, 0.30, 61):
+        for x in np.linspace(-0.36, 0.30, 81):
             q = np.tile(m.qpos0, (2, 1))
             q[:, m.jnt_qposadr[m.body("robot").jntadr[0]]] = x
             d.qpos.assign(q)
@@ -51,7 +53,32 @@ def worker(mode, device):
                 )
                 for i in range(2)
             ]
-            frames.append({"x": float(x), "probe_mesh_contacts": hit})
+            positions = d.contact.pos.numpy()[:n]
+            base = m.geom("base").id
+            base_hits = [
+                sum(
+                    set(map(int, pair)) == {base, probe}
+                    for pair, world in zip(pairs, worlds)
+                    if world == i
+                )
+                for i in range(2)
+            ]
+            points = [
+                [
+                    pos.tolist()
+                    for pair, world, pos in zip(pairs, worlds, positions)
+                    if world == i and set(map(int, pair)) == {slot, probe}
+                ]
+                for i in range(2)
+            ]
+            frames.append(
+                {
+                    "x": float(x),
+                    "probe_mesh_contacts": hit,
+                    "base_contacts": base_hits,
+                    "contact_points": points,
+                }
+            )
     target = ROOT / "outputs" / f"{mode}.json"
     target.write_text(
         json.dumps({"mode": mode, "device": device, "frames": frames}, indent=2)
@@ -59,98 +86,131 @@ def worker(mode, device):
 
 
 def render(traces):
+    """MuJoCo renders one scene with both worlds; Pillow only adds captions."""
     import imageio.v2 as imageio
+    import mujoco
     import numpy as np
     from PIL import Image, ImageDraw, ImageFont
 
-    font = ImageFont.load_default(size=18)
-    small = ImageFont.load_default(size=15)
+    model = mujoco.MjModel.from_xml_path(str(ROOT / "assets/render.xml"))
+    data = mujoco.MjData(model)
+    camera = mujoco.MjvCamera()
+    camera.lookat[:] = [-0.08, 0, 0.04]
+    camera.distance = 1.95
+    camera.azimuth = 90
+    camera.elevation = -62
+    font = ImageFont.load_default(size=20)
+    small = ImageFont.load_default(size=16)
     images = []
     writers = {
         mode: imageio.get_writer(
             str(ROOT / "media" / f"{mode}.mp4"),
-            fps=15,
+            fps=20,
             codec="libx264",
             macro_block_size=1,
         )
         for mode in traces
     }
     combined = imageio.get_writer(
-        str(ROOT / "media/comparison.mp4"), fps=15, codec="libx264", macro_block_size=1
+        str(ROOT / "media/comparison.mp4"), fps=20, codec="libx264", macro_block_size=1
     )
-    try:
-        for index in range(61):
-            panels = []
-            for mode, trace in traces.items():
-                im = Image.new("RGB", (560, 440), "#101827")
-                draw = ImageDraw.Draw(im)
-                draw.text(
-                    (20, 14),
-                    f"{mode.upper()}: Warp 3.11 "
-                    + ("stock" if mode == "before" else "+ guard"),
-                    font=font,
-                    fill="white",
-                )
-                f = trace["frames"][index]
-                for world in range(2):
-                    top = 60 + world * 170
+    with mujoco.Renderer(model, height=600, width=720) as renderer:
+        try:
+            for index in range(len(traces["before"]["frames"])):
+                panels = []
+                for mode, trace in traces.items():
+                    f = trace["frames"][index]
+                    for world in range(2):
+                        data.qpos[
+                            model.jnt_qposadr[model.joint(f"probe{world}").id]
+                        ] = f["x"]
+                    for world in range(2):
+                        model.geom(f"probe_geom{world}").rgba[:] = (
+                            [1.0, 0.12, 0.12, 1.0]
+                            if f["probe_mesh_contacts"][world]
+                            else [0.98, 0.65, 0.12, 1.0]
+                        )
+                    mujoco.mj_forward(model, data)
+                    renderer.update_scene(data, camera=camera)
+                    # Contact markers use actual Warp contact positions, not CPU contacts.
+                    for world in range(2):
+                        for point in f["contact_points"][world]:
+                            pos = np.array(point) + [
+                                0,
+                                0.36 if world == 0 else -0.36,
+                                0,
+                            ]
+                            geom = renderer.scene.geoms[renderer.scene.ngeom]
+                            mujoco.mjv_initGeom(
+                                geom,
+                                mujoco.mjtGeom.mjGEOM_SPHERE,
+                                np.array([0.012] * 3),
+                                pos,
+                                np.eye(3).ravel(),
+                                np.array([1.0, 0.12, 0.12, 1.0], dtype=np.float32),
+                            )
+                            renderer.scene.ngeom += 1
+                    im = Image.fromarray(renderer.render())
+                    draw = ImageDraw.Draw(im)
+                    draw.rectangle((0, 0, 720, 62), fill="#101827")
                     draw.text(
-                        (20, top),
-                        "ABSENT mesh (dataid = -1)"
-                        if world == 0
-                        else "VALID mesh (control)",
+                        (20, 10),
+                        f"{mode.upper()} | MuJoCo-Warp 3.11 "
+                        + ("stock" if mode == "before" else "+ collision guard"),
+                        font=font,
+                        fill="white",
+                    )
+                    draw.text(
+                        (20, 36),
+                        "One scene / two worlds / same prescribed probe sweep",
+                        font=small,
+                        fill="#b5c3d9",
+                    )
+                    draw.rectangle((0, 514, 720, 600), fill="#101827")
+                    draw.text(
+                        (20, 524),
+                        f"Small box: padded-slot contacts = {f['probe_mesh_contacts'][0]}",
+                        font=font,
+                        fill="#ff677e" if f["probe_mesh_contacts"][0] else "#6ce4b5",
+                    )
+                    draw.text(
+                        (20, 551),
+                        f"Large box: valid-slot contacts = {f['probe_mesh_contacts'][1]}",
                         font=font,
                         fill="#b5c3d9",
                     )
-                    cx, cy, scale = 280, top + 85, 550
-                    if world:
-                        draw.rectangle(
-                            (cx - 55, cy - 55, cx + 55, cy + 55), fill="#426a8f"
-                        )
-                    else:
-                        draw.line((cx - 6, cy, cx + 6, cy), fill="#526176", width=1)
-                        draw.line((cx, cy - 6, cx, cy + 6), fill="#526176", width=1)
-                    px, radius = cx + f["x"] * scale, 0.08 * scale
-                    hit = f["probe_mesh_contacts"][world]
-                    draw.ellipse(
-                        (px - radius, cy - radius, px + radius, cy + radius),
-                        fill="#efab43",
-                        outline="#ffd78b",
-                        width=2,
-                    )
-                    if hit:
-                        draw.line((px, cy, cx, cy), fill="#ff5a71", width=4)
                     draw.text(
-                        (20, top + 140),
-                        f"Measured probe/mesh contacts: {hit}",
+                        (20, 580),
+                        f"Red probe/dots: measured slot contact | frame {index + 1}/81",
                         font=small,
-                        fill="#ff5a71" if hit else "#6ce4b5",
+                        fill="#b5c3d9",
                     )
-                draw.text(
-                    (20, 412),
-                    f"Top view | prescribed motion | frame {index + 1}/61",
-                    font=small,
-                    fill="#b5c3d9",
-                )
-                writers[mode].append_data(np.array(im))
-                panels.append(im)
-            both = Image.new("RGB", (1120, 440))
-            both.paste(panels[0], (0, 0))
-            both.paste(panels[1], (560, 0))
-            combined.append_data(np.array(both))
-            images.append(both)
-        images[30].save(ROOT / "media/contact-frame.png")
-        images[0].save(
-            ROOT / "media/comparison.gif",
-            save_all=True,
-            append_images=images[1:],
-            duration=67,
-            loop=0,
-        )
-    finally:
-        combined.close()
-        for writer in writers.values():
-            writer.close()
+                    writers[mode].append_data(np.array(im))
+                    panels.append(im)
+                both = Image.new("RGB", (1440, 600))
+                both.paste(panels[0], (0, 0))
+                both.paste(panels[1], (720, 0))
+                combined.append_data(np.array(both))
+                images.append(both)
+            # Select a phantom-contact frame with the probe clear of the small box.
+            idx = next(
+                i
+                for i, f in enumerate(traces["before"]["frames"])
+                if f["probe_mesh_contacts"][0] and f["x"] > 0.025
+            )
+            images[idx].save(ROOT / "media/contact-frame.png")
+            previews = [im.resize((960, 400)) for im in images]
+            previews[0].save(
+                ROOT / "media/comparison.gif",
+                save_all=True,
+                append_images=previews[1:],
+                duration=50,
+                loop=0,
+            )
+        finally:
+            combined.close()
+            for writer in writers.values():
+                writer.close()
 
 
 def main():
@@ -206,6 +266,12 @@ def main():
     assert [f["probe_mesh_contacts"][1] for f in traces["before"]["frames"]] == [
         f["probe_mesh_contacts"][1] for f in traces["after"]["frames"]
     ]
+    assert [f["base_contacts"] for f in traces["before"]["frames"]] == [
+        f["base_contacts"] for f in traces["after"]["frames"]
+    ]
+    assert all(
+        any(f["base_contacts"][w] for f in traces["after"]["frames"]) for w in range(2)
+    )
     env["PYTHONPATH"] = str(ROOT / ".runtime/fixed")
     with (ROOT / "outputs/regression.log").open("w") as log:
         subprocess.run(

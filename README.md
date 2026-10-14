@@ -17,7 +17,7 @@ uv sync --locked
 uv run --locked scripts/reproduce.py
 ```
 
-This uses Python 3.11 and a committed lockfile. CPU is the default; no GPU, Torch, MjLab installation, display server, system FFmpeg, Hugging Face account, motion dataset or robot assets are needed. Initial installation needs network access; subsequent runs reuse the environment and Warp kernel cache. Kernel compilation takes additional time on a cold cache.
+This uses Python 3.11 and a committed lockfile. CPU collision computation is the default; no CUDA compute, Torch, MjLab installation, display server (headless EGL rendering), system FFmpeg, Hugging Face account, motion dataset or robot assets are needed. Initial installation needs network access; subsequent runs reuse the environment and Warp kernel cache. Kernel compilation takes additional time on a cold cache.
 
 Optional CUDA execution, on a machine with a compatible NVIDIA driver:
 
@@ -36,9 +36,15 @@ The command exits unsuccessfully unless stock produces absent-mesh contacts, the
 
 ## What the animation shows
 
-This is a **top-view collision diagnostic**, not a free-dynamics rollout or a reproduction of a robot knocking over a lamp. The sphere follows the same prescribed 61-position sweep in both runs. Each frame calls real MuJoCo-Warp `kinematics` and `collision`; the red line indicates a measured probe/mesh contact pair, not a contact normal or force. The small cross denotes the absent slot's origin; it is not a physical object. The lower panel retains the cube as a positive control. Rendering uses Pillow and therefore needs no OpenGL.
+MuJoCo's native offscreen renderer draws **one scene containing two environments** in each before/after video, including shadows, lighting and perspective. Both environments always contain a visible box. The upper blue box is 0.2 m wide; the lower green box is 0.4 m wide. Both probes follow the same prescribed 81-position sweep. The combined video places the stock and patched scenes side by side.
 
-The asset is an inline eight-vertex cube, plane and sphere in `assets/scene.xml`. Two worlds share the compiled model; only world zero's mesh data ID is set to -1, matching the missing-part representation relevant to MjLab variants. No Weave data or third-party mesh is included. The fixture intentionally intersects the valid cube with the floor to exercise primitive collision handling as well.
+The small box uses one valid cube mesh plus one absent padding slot. The large box uses two adjacent valid cube meshes forming a rectangular box. Both share the same compiled two-slot layout; only the small world's second mesh ID is -1. This reproduces variable collision-part counts without making either object disappear. The renderer uses equivalent solid box geometry for the visible union of valid meshes.
+
+Each frame calls real MuJoCo-Warp `kinematics` and `collision`. A red probe indicates a measured contact with the second slot; red dots mark its actual Warp contact positions (sometimes occluded by solid geometry). Thus a red probe beside the small box demonstrates a phantom padding-slot contact. Large-box slot contacts remain after the fix. Contacts with the valid first mesh are also checked and remain identical before/after.
+
+This is prescribed-motion collision inspection, **not a free-dynamics rollout**: probes may pass through boxes because no dynamics step is requested. Only caption text and video composition use Pillow; all scene geometry is rendered by MuJoCo. `assets/variants.xml` is the physics fixture, `assets/render.xml` the two-environment display scene, and `assets/scene.xml` the original eight-case regression fixture. All geometry is synthetic.
+
+The default headless renderer uses EGL and needs a working system EGL/OpenGL driver (Mesa or NVIDIA); these system drivers cannot be installed through uv. On a desktop supporting GLFW, use `MUJOCO_GL=glfw uv run --locked scripts/reproduce.py`. If EGL initialization fails, configure the host graphics driver rather than changing the collision dependencies.
 
 ## Patch isolation and scope
 
@@ -48,8 +54,6 @@ The source guard is needed in **MuJoCo-Warp**, not in MuJoCo's CPU engine. MjLab
 
 This targets a **3.11 backport**, not an assertion that current upstream main still has the same bug. Newer upstream missing-mesh work must be considered when choosing the PR destination. It does not upgrade to 3.15 or change actuator interfaces.
 
-## Observed CPU result
+## Observed result
 
-On the development machine, the complete command took 10.91 seconds with existing Warp kernel caches (installation excluded). Out of 61 frames, stock produced absent-slot contacts in 15 frames; patched produced zero. The valid mesh produced contacts in 33 frames in both runs, with identical per-frame counts. All eight fixed-backend regression cases passed. Fresh kernel compilation and download time vary by machine; this is not a cold-start timing guarantee. CUDA execution is provided as an option and has not been validated in this standalone environment.
-
-All fixture geometry was created synthetically for this reproducer. The videos are generated from recorded collision results, not manually authored contact labels.
+The full 81-frame native-render command took 14.74 seconds on the development machine with warm Warp kernel caches, excluding installation. Stock produced absent-slot contacts in 19 frames; patched produced zero. The large box's second mesh produced contacts in 44 frames in both runs, with identical per-frame counts. Valid first-mesh contacts also matched in both worlds. All eight backend regression cases passed. Cold compilation, graphics drivers and download time vary; this is not a cold-start guarantee. Collision execution was verified on CPU; native rendering used EGL. CUDA collision execution has not been validated in this standalone environment.
