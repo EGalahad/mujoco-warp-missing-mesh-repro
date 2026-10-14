@@ -59,3 +59,11 @@ This targets a **3.11 backport**, not an assertion that current upstream main st
 At 0.58 seconds, the stock small-box ball is about 9.9 cm away from the actual box surface but reverses horizontal velocity from -0.600 to +0.106 m/s. After the patch, there is no absent-slot contact; the ball reaches the actual box before rebounding. The entire large-box trajectory matches within 1e-6 m/quaternion component, and all eight static regression cases pass. The command checks these conditions rather than merely drawing labels.
 
 At 2.02 seconds, small-box x is +0.151 m before versus +0.003 m after (both have rebounded by then); large-box x is +0.308 m in both runs. The first full dynamic/video run took 26.65 seconds on this machine, including some kernel compilation, with dependencies already installed. Timing depends on CPU, graphics driver and cache state. This standalone run used CPU physics plus EGL rendering; CUDA physics remains an optional unverified path here.
+
+## Backend backport
+
+The proposed v3.11.0 source change and native regression test are included in
+[`patches/warp-3.11-collision-fix.patch`](patches/warp-3.11-collision-fix.patch).
+This is separate from MjLab's integration regression: the MjLab test requires a
+backend distributing the missing-mesh guard. The reproduction command above
+applies its private patch automatically and does not change installed packages.

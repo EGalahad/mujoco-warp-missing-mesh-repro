@@ -1,0 +1,127 @@
+diff --git a/mujoco_warp/_src/collision_driver.py b/mujoco_warp/_src/collision_driver.py
+index 3eba67a..53fd691 100644
+--- a/mujoco_warp/_src/collision_driver.py
++++ b/mujoco_warp/_src/collision_driver.py
+@@ -338,6 +338,7 @@ def _broadphase_filter(opt_broadphase_filter: int, ngeom_aabb: int, ngeom_rbound
+ def _add_geom_pair(
+   # Model:
+   geom_type: wp.array[int],
++  geom_dataid: wp.array2d[int],
+   nxn_pairid: wp.array[wp.vec2i],
+   # Data in:
+   naconmax_in: int,
+@@ -353,6 +354,13 @@ def _add_geom_pair(
+   collision_pairid_out: wp.array[wp.vec2i],
+   collision_worldid_out: wp.array[int],
+ ):
++  # Missing mesh slots must not produce collision candidates.
++  setid = worldid % geom_dataid.shape[0]
++  if geom_type[geom1] == GeomType.MESH and geom_dataid[setid, geom1] < 0:
++    return
++  if geom_type[geom2] == GeomType.MESH and geom_dataid[setid, geom2] < 0:
++    return
++
+   pairid = wp.atomic_add(ncollision_out, 0, 1)
+ 
+   if pairid >= naconmax_in:
+@@ -435,6 +443,7 @@ def _sap_broadphase(
+     # Model:
+     ngeom: int,
+     geom_type: wp.array[int],
++    geom_dataid: wp.array2d[int],
+     geom_bodyid: wp.array[int],
+     geom_aabb: wp.array3d[wp.vec3],
+     geom_rbound: wp.array2d[float],
+@@ -521,6 +530,7 @@ def _sap_broadphase(
+       ):
+         _add_geom_pair(
+           geom_type,
++          geom_dataid,
+           nxn_pairid,
+           naconmax_in,
+           geom1,
+@@ -661,6 +671,7 @@ def sap_broadphase(
+     inputs=[
+       m.ngeom,
+       m.geom_type,
++      m.geom_dataid,
+       m.geom_bodyid,
+       m.geom_aabb,
+       m.geom_rbound,
+@@ -695,6 +706,7 @@ def _nxn_broadphase(
+   def kernel(
+     # Model:
+     geom_type: wp.array[int],
++    geom_dataid: wp.array2d[int],
+     geom_bodyid: wp.array[int],
+     geom_aabb: wp.array3d[wp.vec3],
+     geom_rbound: wp.array2d[float],
+@@ -755,6 +767,7 @@ def _nxn_broadphase(
+     ):
+       _add_geom_pair(
+         geom_type,
++        geom_dataid,
+         nxn_pairid,
+         naconmax_in,
+         geom1,
+@@ -836,6 +849,7 @@ def nxn_broadphase(
+       dim=(d.nworld, m.nxn_geom_pair_filtered.shape[0]),
+       inputs=[
+         m.geom_type,
++        m.geom_dataid,
+         m.geom_bodyid,
+         m.geom_aabb,
+         m.geom_rbound,
+diff --git a/mujoco_warp/_src/collision_missing_mesh_test.py b/mujoco_warp/_src/collision_missing_mesh_test.py
+new file mode 100644
+index 0000000..de350c7
+--- /dev/null
++++ b/mujoco_warp/_src/collision_missing_mesh_test.py
+@@ -0,0 +1,47 @@
++"""Collision regression for absent per-world and broadcast mesh slots."""
++
++import mujoco
++import numpy as np
++import warp as wp
++from absl.testing import absltest
++from absl.testing import parameterized
++
++import mujoco_warp as mjw
++from mujoco_warp import BroadphaseType
++
++_XML = """<mujoco><asset><mesh name="cube" vertex="-.1 -.1 -.1 -.1 -.1 .1 -.1 .1 -.1 -.1 .1 .1 .1 -.1 -.1 .1 -.1 .1 .1 .1 -.1 .1 .1 .1"/></asset><worldbody><geom name="floor" type="plane" size="1 1 .1"/><body name="object" pos="0 0 .09"><freejoint/><geom name="slot" type="mesh" mesh="cube"/></body><body name="robot" pos=".05 0 .1"><freejoint/><geom name="probe" type="sphere" size=".08"/></body></worldbody></mujoco>"""
++
++
++class MissingMeshTest(parameterized.TestCase):
++  @parameterized.product(
++    broadphase=[BroadphaseType.NXN, BroadphaseType.SAP_TILE],
++    layout=["single_missing", "broadcast_missing", "mixed", "broadcast_valid"],
++  )
++  def test_missing_mesh_contacts(self, broadphase, layout):
++    model = mujoco.MjModel.from_xml_string(_XML)
++    slot, probe, floor = (model.geom(name).id for name in ("slot", "probe", "floor"))
++    nworld = 1 if layout == "single_missing" else 2
++    wp_model = mjw.put_model(model)
++    wp_model.opt.broadphase = broadphase
++    dataid = np.tile(model.geom_dataid, (2 if layout == "mixed" else 1, 1))
++    if layout != "broadcast_valid":
++      dataid[0, slot] = -1
++    wp_model.geom_dataid = wp.array(dataid, dtype=int)
++    data = mjw.make_data(model, nworld=nworld, nconmax=64, njmax=64)
++    mjw.kinematics(wp_model, data)
++    mjw.collision(wp_model, data)
++    wp.synchronize()
++    count = int(data.nacon.numpy()[0])
++    pairs = data.contact.geom.numpy()[:count]
++    worlds = data.contact.worldid.numpy()[:count]
++    for world in range(nworld):
++      contacts = {tuple(sorted(map(int, pair))) for pair in pairs[worlds == world]}
++      if dataid[world % len(dataid), slot] < 0:
++        self.assertFalse(any(slot in pair for pair in contacts))
++      else:
++        self.assertIn(tuple(sorted((slot, probe))), contacts)
++        self.assertIn(tuple(sorted((slot, floor))), contacts)
++
++
++if __name__ == "__main__":
++  absltest.main()
