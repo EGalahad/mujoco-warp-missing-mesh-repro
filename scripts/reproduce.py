@@ -35,13 +35,18 @@ def worker(mode, device):
         ids[0, slot] = -1
         w.geom_dataid = wp.array(ids, dtype=int)
         d = mw.make_data(m, nworld=2, nconmax=64, njmax=64)
-        for x in np.linspace(-0.36, 0.30, 81):
-            q = np.tile(m.qpos0, (2, 1))
-            q[:, m.jnt_qposadr[m.body("robot").jntadr[0]]] = x
-            d.qpos.assign(q)
-            mw.kinematics(w, d)
-            mw.collision(w, d)
+        velocity = np.zeros((2, m.nv))
+        velocity[:, 0] = -0.6
+        velocity[:, 4] = -0.6 / 0.08  # rolling without initial slip
+        d.qvel.assign(velocity)
+        ghost_total = 0
+        for frame in range(101):
+            # No state or control changes after initialization: actual gravity/contact dynamics.
+            for _ in range(4):
+                mw.step(w, d)
             wp.synchronize()
+            state = d.qpos.numpy().copy()
+            velocity_now = d.qvel.numpy().copy()
             n = int(d.nacon.numpy()[0])
             pairs = d.contact.geom.numpy()[:n]
             worlds = d.contact.worldid.numpy()[:n]
@@ -71,10 +76,14 @@ def worker(mode, device):
                 ]
                 for i in range(2)
             ]
+            ghost_total += hit[0]
             frames.append(
                 {
-                    "x": float(x),
+                    "qpos": state.tolist(),
+                    "qvel": velocity_now.tolist(),
+                    "time": float((frame + 1) * 0.02),
                     "probe_mesh_contacts": hit,
+                    "ghost_contact_frames": ghost_total,
                     "base_contacts": base_hits,
                     "contact_points": points,
                 }
@@ -105,14 +114,14 @@ def render(traces):
     writers = {
         mode: imageio.get_writer(
             str(ROOT / "media" / f"{mode}.mp4"),
-            fps=20,
+            fps=25,
             codec="libx264",
             macro_block_size=1,
         )
         for mode in traces
     }
     combined = imageio.get_writer(
-        str(ROOT / "media/comparison.mp4"), fps=20, codec="libx264", macro_block_size=1
+        str(ROOT / "media/comparison.mp4"), fps=25, codec="libx264", macro_block_size=1
     )
     with mujoco.Renderer(model, height=600, width=720) as renderer:
         try:
@@ -121,9 +130,9 @@ def render(traces):
                 for mode, trace in traces.items():
                     f = trace["frames"][index]
                     for world in range(2):
-                        data.qpos[
-                            model.jnt_qposadr[model.joint(f"probe{world}").id]
-                        ] = f["x"]
+                        address = model.jnt_qposadr[model.joint(f"probe{world}").id]
+                        data.qpos[address : address + 7] = f["qpos"][world]
+                        data.qpos[address + 1] += 0.36 if world == 0 else -0.36
                     for world in range(2):
                         model.geom(f"probe_geom{world}").rgba[:] = (
                             [1.0, 0.12, 0.12, 1.0]
@@ -162,26 +171,26 @@ def render(traces):
                     )
                     draw.text(
                         (20, 36),
-                        "One scene / two worlds / same prescribed probe sweep",
+                        "Two worlds / free rolling balls / gravity + contact solver",
                         font=small,
                         fill="#b5c3d9",
                     )
                     draw.rectangle((0, 514, 720, 600), fill="#101827")
                     draw.text(
                         (20, 524),
-                        f"Small box: padded-slot contacts = {f['probe_mesh_contacts'][0]}",
+                        f"Small box: x = {f['qpos'][0][0]:+.3f} m | ghost hits: {f['ghost_contact_frames']}",
                         font=font,
                         fill="#ff677e" if f["probe_mesh_contacts"][0] else "#6ce4b5",
                     )
                     draw.text(
                         (20, 551),
-                        f"Large box: valid-slot contacts = {f['probe_mesh_contacts'][1]}",
+                        f"Large box: x = {f['qpos'][1][0]:+.3f} m | contacts: {f['probe_mesh_contacts'][1]}",
                         font=font,
                         fill="#b5c3d9",
                     )
                     draw.text(
                         (20, 580),
-                        f"Red probe/dots: measured slot contact | frame {index + 1}/81",
+                        f"Red probe/dots: measured slot contact | t={f['time']:.2f}s (0.5x speed)",
                         font=small,
                         fill="#b5c3d9",
                     )
@@ -193,18 +202,14 @@ def render(traces):
                 combined.append_data(np.array(both))
                 images.append(both)
             # Select a phantom-contact frame with the probe clear of the small box.
-            idx = next(
-                i
-                for i, f in enumerate(traces["before"]["frames"])
-                if f["probe_mesh_contacts"][0] and f["x"] > 0.025
-            )
+            idx = len(images) - 1
             images[idx].save(ROOT / "media/contact-frame.png")
             previews = [im.resize((960, 400)) for im in images]
             previews[0].save(
                 ROOT / "media/comparison.gif",
                 save_all=True,
                 append_images=previews[1:],
-                duration=50,
+                duration=40,
                 loop=0,
             )
         finally:
@@ -266,12 +271,15 @@ def main():
     assert [f["probe_mesh_contacts"][1] for f in traces["before"]["frames"]] == [
         f["probe_mesh_contacts"][1] for f in traces["after"]["frames"]
     ]
-    assert [f["base_contacts"] for f in traces["before"]["frames"]] == [
-        f["base_contacts"] for f in traces["after"]["frames"]
-    ]
-    assert all(
-        any(f["base_contacts"][w] for f in traces["after"]["frames"]) for w in range(2)
+    import numpy as np
+
+    before_states = np.array([f["qpos"] for f in traces["before"]["frames"]])
+    after_states = np.array([f["qpos"] for f in traces["after"]["frames"]])
+    assert np.isfinite(before_states).all() and np.isfinite(after_states).all()
+    np.testing.assert_allclose(
+        before_states[:, 1], after_states[:, 1], atol=1e-6, rtol=0
     )
+    assert before_states[-1, 0, 0] - after_states[-1, 0, 0] > 0.04
     env["PYTHONPATH"] = str(ROOT / ".runtime/fixed")
     with (ROOT / "outputs/regression.log").open("w") as log:
         subprocess.run(
@@ -281,10 +289,30 @@ def main():
             stderr=subprocess.STDOUT,
             check=True,
         )
+    event_index = next(
+        i
+        for i, f in enumerate(traces["before"]["frames"])
+        if f["probe_mesh_contacts"][0]
+    )
+    event = traces["before"]["frames"][event_index]
+    incoming = traces["before"]["frames"][event_index - 1]["qvel"][0][0]
+    outgoing = event["qvel"][0][0]
+    gap = event["qpos"][0][0] - 0.08 - (-0.1)
+    assert incoming < -0.5 and outgoing > 0 and gap > 0.05
     render(traces)
     report = {
         "frames_with_contacts_absent_valid": counts,
         "regression_cases": 8,
+        "phantom_impact": {
+            "time": event["time"],
+            "visible_box_gap_m": gap,
+            "vx_before": incoming,
+            "vx_after": outgoing,
+        },
+        "final_ball_x_before_after": [
+            before_states[-1, :, 0].tolist(),
+            after_states[-1, :, 0].tolist(),
+        ],
         "elapsed_seconds": round(time.monotonic() - start, 2),
         "device": args.device,
         "stock_source_sha256": digest,

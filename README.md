@@ -32,19 +32,19 @@ Outputs:
 - `outputs/summary.json`: assertions and measured execution time.
 - `outputs/{before,after,regression}.log`: backend logs and eight regression cases.
 
-The command exits unsuccessfully unless stock produces absent-mesh contacts, the patch removes them, and the entire valid-mesh contact sequence is unchanged. It also checks both NXN and SAP_TILE across single-world, broadcast-absent, mixed-world and broadcast-valid layouts, including valid mesh/floor contacts.
+The command exits unsuccessfully unless stock produces absent-mesh contacts, the patch removes them, and the entire large-box motion and valid-slot contact sequence are unchanged. It also verifies a velocity reversal while the small-box ball is still more than 5 cm from visible geometry. It also checks both NXN and SAP_TILE across single-world, broadcast-absent, mixed-world and broadcast-valid layouts, including valid mesh/floor contacts.
 
 ## What the animation shows
 
-MuJoCo's native offscreen renderer draws **one scene containing two environments** in each before/after video, including shadows, lighting and perspective. Both environments always contain a visible box. The upper blue box is 0.2 m wide; the lower green box is 0.4 m wide. Both probes follow the same prescribed 81-position sweep. The combined video places the stock and patched scenes side by side.
+This is **real free-body dynamics**, using `mujoco_warp.step` with gravity, friction and the constraint/contact solver. Each ball starts at x=0.42 m, radius 0.08 m, horizontal velocity -0.6 m/s and matching rolling angular velocity. After initialization, no positions, velocities, forces or controls are prescribed. Boxes are fixed obstacles. The simulation runs for 2.02 seconds with a 0.005-second physics step; the video plays at half speed.
 
-The small box uses one valid cube mesh plus one absent padding slot. The large box uses two adjacent valid cube meshes forming a rectangular box. Both share the same compiled two-slot layout; only the small world's second mesh ID is -1. This reproduces variable collision-part counts without making either object disappear. The renderer uses equivalent solid box geometry for the visible union of valid meshes.
+MuJoCo's native renderer shows two environments in a single scene. The upper blue box is 0.2 m wide, represented by one valid mesh plus an absent padding slot. The lower green box is 0.4 m wide, represented by two adjacent valid meshes. Both worlds share the compiled slot layout. Both boxes remain visible throughout. Only the small world's second mesh data ID is -1.
 
-Each frame calls real MuJoCo-Warp `kinematics` and `collision`. A red probe indicates a measured contact with the second slot; red dots mark its actual Warp contact positions (sometimes occluded by solid geometry). Thus a red probe beside the small box demonstrates a phantom padding-slot contact. Large-box slot contacts remain after the fix. Contacts with the valid first mesh are also checked and remain identical before/after.
+**Before:** the small-box ball rebounds while still in empty space. **After:** it travels onward until it hits the real small box. The large-box control trajectory is identical before and after. The checker texture makes ball rotation visible. Red coloring and dots indicate actual Warp contacts with the second mesh slot; the cumulative ghost-hit counter keeps the brief false impact visible in the captions. Red dots may be occluded by solid geometry.
 
-This is prescribed-motion collision inspection, **not a free-dynamics rollout**: probes may pass through boxes because no dynamics step is requested. Only caption text and video composition use Pillow; all scene geometry is rendered by MuJoCo. `assets/variants.xml` is the physics fixture, `assets/render.xml` the two-environment display scene, and `assets/scene.xml` the original eight-case regression fixture. All geometry is synthetic.
+Every displayed ball pose comes from recorded simulation qpos, including orientation and vertical displacement. Rendering does not advance physics. `assets/variants.xml` is the dynamic fixture; `assets/render.xml` combines both worlds for display using equivalent solid boxes; `assets/scene.xml` is the original eight-case static regression fixture. Pillow only adds captions and assembles the videos.
 
-The default headless renderer uses EGL and needs a working system EGL/OpenGL driver (Mesa or NVIDIA); these system drivers cannot be installed through uv. On a desktop supporting GLFW, use `MUJOCO_GL=glfw uv run --locked scripts/reproduce.py`. If EGL initialization fails, configure the host graphics driver rather than changing the collision dependencies.
+The headless renderer defaults to EGL and requires a working host EGL/OpenGL driver (Mesa or NVIDIA), which uv cannot provide. On a desktop supporting GLFW, use `MUJOCO_GL=glfw uv run --locked scripts/reproduce.py`. All fixture geometry is synthetic.
 
 ## Patch isolation and scope
 
@@ -56,4 +56,6 @@ This targets a **3.11 backport**, not an assertion that current upstream main st
 
 ## Observed result
 
-The full 81-frame native-render command took 14.74 seconds on the development machine with warm Warp kernel caches, excluding installation. Stock produced absent-slot contacts in 19 frames; patched produced zero. The large box's second mesh produced contacts in 44 frames in both runs, with identical per-frame counts. Valid first-mesh contacts also matched in both worlds. All eight backend regression cases passed. Cold compilation, graphics drivers and download time vary; this is not a cold-start guarantee. Collision execution was verified on CPU; native rendering used EGL. CUDA collision execution has not been validated in this standalone environment.
+At 0.58 seconds, the stock small-box ball is about 9.9 cm away from the actual box surface but reverses horizontal velocity from -0.600 to +0.106 m/s. After the patch, there is no absent-slot contact; the ball reaches the actual box before rebounding. The entire large-box trajectory matches within 1e-6 m/quaternion component, and all eight static regression cases pass. The command checks these conditions rather than merely drawing labels.
+
+At 2.02 seconds, small-box x is +0.151 m before versus +0.003 m after (both have rebounded by then); large-box x is +0.308 m in both runs. The first full dynamic/video run took 26.65 seconds on this machine, including some kernel compilation, with dependencies already installed. Timing depends on CPU, graphics driver and cache state. This standalone run used CPU physics plus EGL rendering; CUDA physics remains an optional unverified path here.
